@@ -41,7 +41,9 @@ import jayutils
 try:
     import vivisect
     import envi.bits as e_bits
+    import envi.memory as e_mem
     from visgraph import pathcore as vg_path
+    from vivisect.const import *
 except Exception, err:
     print 'Error importing stuff!'
     raise
@@ -90,6 +92,15 @@ def stack_track_visitor(node, **kwargs):
             #just looking for wchar strings made of ascii chars
             agg.addItem((eip, va, bytes))
             logger.debug('Adding possible wchar wlog entry: 0x%08x 0x%08x: %s', eip, va, binascii.hexlify(bytes))
+        # Look for mov like this:
+        # C7 45 88 6E 67 73 00   mov     [ebp+var_78], 73676Eh
+        # Notice the NULL byte at the end, we want addItem/aggregateStack here
+        # to capture the full string, otherwise the end of the string is mised
+        elif op.mnem.startswith('mov') and isAscii(bytes[0]) and bytes[-1] == '\x00':
+            if all([(isAscii(i) or i == '\x00') for i in bytes]):
+                agg.addItem((eip, va, bytes))
+                agg.aggregateStack()
+                logger.debug('Adding wlog entry with null write: 0x%08x 0x%08x: %s', eip, va, binascii.hexlify(bytes))
         else:
             logger.debug('Skipping wlog entry: 0x%08x 0x%08x: %s', eip, va, binascii.hexlify(bytes))
     agg.aggregateStack()
@@ -119,12 +130,23 @@ class StringAccumulator(object):
         idx = string.find('\x00')
         if idx >= 0:
             string = string[:idx]
+            item = entry, string
         eip, va, bytes = entry
         if len(self.stringDict.get(eip, ((None,None,None),'') )[1]) < len(string):
-            self.logger.debug('Emitting string: 0x%08x: %s', eip, string)
-            self.logger.debug('\n    %s', eip, binascii.hexlify(string))
-            #self.logger.debug('Current stackDict:\n%s', pprint.pformat(self.stackDict))
-            self.stringDict[eip] = item
+            # Check if the string is a part of a larger string
+            skip = False
+            for _, itm in self.stringDict.iteritems():
+                entry_va = itm[0][1]
+                entry_str = itm[1]
+                if entry_va <= va < (entry_va + len(entry_str)):
+                    skip=True
+                    break
+            if skip:
+                self.logger.debug('Skipping emit: 0x%08x: %s', eip, string)
+            else:
+                self.logger.debug('Emitting string: 0x%08x: %s', eip, string)
+                #self.logger.debug('Current stackDict:\n%s', pprint.pformat(self.stackDict))
+                self.stringDict[eip] = item
         else:
             self.logger.debug('Skipping emit: 0x%08x: %s', eip, string)
 
@@ -144,7 +166,14 @@ class StringAccumulator(object):
     def isNull(self, item):
         '''Returns True if all bytes in the current write log item are '\x00'''
         eip, va, bytes = item
-        return all([i == '\x00' for i in bytes])
+        ret = False
+        if bytes[-1] == '\x00':
+            if len(bytes) >= 4:
+                if all( [isAscii(i) for i in bytes[::2]])  and all([i =='\x00' for i in bytes[1::2]]):
+                    ret = False
+                else:
+                    ret = True
+        return ret#all([i == '\x00' for i in bytes])
 
     def runStackLength(self, stackLocs, startIdx, endIdx):
         #emit the previous run
@@ -175,7 +204,7 @@ class StringAccumulator(object):
                 if self.isNull(self.stackDict[key2]):
                     eip, va, bytes = self.stackDict[key2]
                     self.logger.debug('Found null at 0x%08x: 0x%08x', eip, va)
-                    self.runStackLength(stackLocs, currStartIdx, i)
+                    self.runStackLength(stackLocs, currStartIdx, i+1)
                     #advance beyond null
                     currStartIdx = i+1
             else:
@@ -188,6 +217,32 @@ class StringAccumulator(object):
         self.runStackLength(stackLocs, currStartIdx, len(stackLocs))
 
 #############################################################################
+def myReadMemory(self, va, size):
+    '''
+    Overrides the emu.readMemory method and changes the default 'A' * size 
+     return to '\x00' * size return
+    '''
+    if self.logread:
+        rlog = vg_path.getNodeProp(self.curpath, 'readlog')
+        rlog.append((self.getProgramCounter(),va,size))
+    # If they read an import entry, start a taint...
+    loc = self.vw.getLocation(va)
+    if loc != None:
+        lva, lsize, ltype, ltinfo = loc
+        if ltype == LOC_IMPORT and lsize == size: # They just read an import.
+            ret = self.setVivTaint('import', loc)
+            return e_bits.buildbytes(ret, lsize)
+
+    self._useVirtAddr(va)
+    # Read from the emulator's pages if we havent resolved it yet
+    probeok = self.probeMemory(va, size, e_mem.MM_READ)
+    if self._safe_mem and not probeok:
+        #return 'A' * size
+        return '\x00' * size
+
+
+    return e_mem.MemoryObject.readMemory(self, va, size)
+
 def runStrings(vw, ea, uselocalagg=True):
     '''
     Returns a list of (write log entry, decoded strings)
@@ -202,6 +257,10 @@ def runStrings(vw, ea, uselocalagg=True):
     emu.stack_map_mask = e_bits.sign_extend(0xfff00000, 4, vw.psize)
     emu.stack_map_base = e_bits.sign_extend(0xbfb00000, 4, vw.psize)
     emu.stack_pointer = emu.stack_map_base + 16*4096
+
+    # Giant hack - override the readMemory function 
+    f = type(emu.readMemory)
+    emu.readMemory = f(myReadMemory, emu, vivisect.impemu.emulator.WorkspaceEmulator)
 
     emu.runFunction(ea, maxhit=1, maxloop=1)
     logger = jayutils.getLogger('stack_graph')
@@ -235,7 +294,7 @@ def getFuncRanges(ea, doAllFuncs):
 
 def isLikelyFalsePositiveString(instr):
     #if a string is all 'A' chars, very likely that it's a false positive
-    return all([a == 'A' for a in instr])
+    return not all([isAscii(a) for a in instr])
 
 def main(doAllFuncs=True):
     #doAllFuncs=False
